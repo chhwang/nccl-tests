@@ -11,6 +11,15 @@
 #include <libgen.h>
 #include "cuda.h"
 
+// Options
+#define COMP_NUM_BLOCKS   84
+#define COMP_ITER_PRE     0
+#define COMP_ITER_POST    1
+#define COMP_TYPE         1   // 0:busy_wait, 1:gmem, 2:L2, 3:ffma
+#define SKIP_COMM         0   // 0:disable, 1:enable
+#define SKIP_VERIFICATION 1   // 0:disable, 1:enable
+#define DEMO_BW_SHARING   0   // 0:disable, 1:enable
+
 int test_ncclVersion = 0; // init'd with ncclGetVersion()
 
 #if NCCL_MAJOR >= 2
@@ -348,8 +357,10 @@ testResult_t InitDataReduce(void* data, const size_t count, const size_t offset,
 
 template<typename T>
 __global__ void InitDataKernel(T* data, const size_t N, const int rep, const int rank) {
+#if (SKIP_VERIFICATION == 0)
   for (size_t o=blockIdx.x*blockDim.x+threadIdx.x; o<N; o+=gridDim.x*blockDim.x)
     data[o] = testValue<T>(o, rep, rank);
+#endif // SKIP_VERIFICATION
 }
 
 static void* const initDataKerns[ncclNumTypes] = {
@@ -509,6 +520,155 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
   return testSuccess;
 }
 
+static __global__ void empty_kernel()
+{
+  // Do nothing.
+}
+
+testResult_t runEmpty(struct threadArgs* args, int idx)
+{
+  struct compInfo* info = args->comp_infos + idx;
+  dim3 grid = dim3(1, 1, 1);
+  dim3 block = dim3(1, 1, 1);
+  CUDACHECK(cudaSetDevice(info->gpu_id));
+  CUDACHECK(cudaLaunchKernel((void *)empty_kernel, grid, block, 0, 0, info->stream));
+  return testSuccess;
+}
+
+
+#if (COMP_TYPE == 0) // busy_wait
+
+static __device__ int tmp1;
+static __device__ int tmp2;
+
+static __global__ void busy_wait_kernel()
+{
+    int i = tmp1;
+    while (i < 400000000) ++i;
+    tmp2 = i;
+}
+cudaError_t launchCompKernel(cudaStream_t s, int nblks)
+{
+    dim3 grid = dim3(nblks, 1, 1);
+    dim3 block = dim3(1, 1, 1);
+    return cudaLaunchKernel((void *)busy_wait_kernel, grid, block, 0, 0, s);
+}
+
+#elif (COMP_TYPE == 1) // gmem
+
+// Should be multiple of 32
+#define ARRAY_SIZE      268435456   // 256M
+static __device__ char ld_arr[ARRAY_SIZE];
+static __global__ void gmem_kernel()
+{
+  // Should be multiple of 32 and power of 2
+  constexpr int num_threads = 256;
+  constexpr int unroll_depth = 128;
+  int nd = ARRAY_SIZE >> 3;
+  volatile double *ptr = (volatile double *)ld_arr;
+  double x = 0;
+  int idx = threadIdx.x + blockIdx.x * num_threads;
+  int sz = num_threads * gridDim.x;
+  int usz = sz * unroll_depth;
+  nd -= (nd % usz);
+  for (int it = 0; it < 50; ++it) {
+    for (int i = idx; i < nd; i += usz) {
+      #pragma unroll
+      for (int j = 0; j < unroll_depth; ++j) {
+        x += ptr[i+j*sz];
+      }
+    }
+  }
+  // For avoiding compiler optimization.
+  ((double *)ptr)[idx] = x;
+}
+cudaError_t launchCompKernel(cudaStream_t s, int nblks)
+{
+    dim3 grid = dim3(nblks, 1, 1);
+    dim3 block = dim3(256, 1, 1);
+    return cudaLaunchKernel((void *)gmem_kernel, grid, block, 0, 0, s);
+}
+
+#elif (COMP_TYPE == 2)
+
+// Should be multiple of 32
+#define L2_CACHE_SIZE   6291456   // 6M
+// Should be multiple of 32 and power of 2
+#define NUM_THREADS     256
+
+static __device__ char arr[L2_CACHE_SIZE];
+
+// Referred to code in https://arxiv.org/pdf/1804.06826.pdf
+static __global__ void l2_kernel()
+{
+    constexpr int ntmo = NUM_THREADS - 1;
+    constexpr int nd = L2_CACHE_SIZE / 8;
+    double x = 0;
+    int tid = threadIdx.x;
+    for (int it = 0; it < 500; ++it) {
+        double *ptr = (double *)arr;
+        for (int i = 0; i < nd; i += NUM_THREADS) {
+            #pragma unroll
+            for (int j = 0; j < NUM_THREADS; j += 32) {
+                int offset = (tid + j) & ntmo;
+                asm volatile ("{\t\n"
+                    ".reg .f64 val;\n\t"
+                    "ld.global.cg.f64 val, [%1];\n\t"
+                    "add.f64 %0, val, %0;\n\t"
+                    "}" : "+d"(x) : "l"(ptr+offset) : "memory"
+                );
+            }
+            ptr += 32;
+        }
+    }
+    // For avoiding compiler optimization.
+    ((double *)arr)[tid] = x;
+}
+cudaError_t launchCompKernel(cudaStream_t s, int nblks)
+{
+    dim3 grid = dim3(nblks, 1, 1);
+    dim3 block = dim3(NUM_THREADS, 1, 1);
+    return cudaLaunchKernel((void *)l2_kernel, grid, block, 0, 0, s);
+}
+
+#elif (COMP_TYPE == 3) // ffma
+
+static __device__ float fma_out;
+
+static __global__ void ffma_kernel()
+{
+    float a = -1e5f;
+    float b = -1e5f;
+    for (int it = 0; it < 81920; ++it) {
+        #pragma unroll
+        for (int i = 0; i < 256; ++i) {
+            a = __fmaf_ru(a, 0.9999f, 0.01f);
+            b = __fmaf_ru(b, 0.9999f, 0.01f);
+        }
+    }
+    if (a < 0) {
+        // This is for avoiding compiler optimization.
+        // Program never reach here.
+        fma_out = a + b;
+    }
+}
+cudaError_t launchCompKernel(cudaStream_t s, int nblks)
+{
+    dim3 grid = dim3(nblks, 1, 1);
+    dim3 block = dim3(NUM_THREADS, 1, 1);
+    return cudaLaunchKernel((void *)ffma_kernel, grid, block, 0, 0, s);
+}
+
+#endif // COMP_TYPE
+
+testResult_t runComp(struct threadArgs* args, int idx)
+{
+  struct compInfo* info = args->comp_infos + idx;
+  CUDACHECK(cudaSetDevice(info->gpu_id));
+  CUDACHECK(launchCompKernel(info->stream, COMP_NUM_BLOCKS));
+  return testSuccess;
+}
+
 testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t opIndex, int root, int in_place, int iter) {
   size_t count = args->nbytes / wordSize(type);
 
@@ -588,7 +748,7 @@ testResult_t completeColl(struct threadArgs* args) {
   return testSuccess;
 }
 
-testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
+testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, int demo) {
   size_t count = args->nbytes / wordSize(type);
   if (datacheck) {
     // Initialize sendbuffs, recvbuffs and expected
@@ -615,8 +775,18 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 #endif
 
+  int gpu_id;
+  CUDACHECK(cudaGetDevice(&gpu_id));
+
+  for (int iter = 0; iter < COMP_ITER_PRE; iter++) {
+    for (int i = 0; i < args->nGpus; i++) {
+      TESTCHECK(runComp(args, i));
+    }
+  }
+
   // Performance Benchmark
   auto start = std::chrono::high_resolution_clock::now();
+#if (SKIP_COMM == 0)
   for (int iter = 0; iter < iters; iter++) {
     if (agg_iters>1) NCCLCHECK(ncclGroupStart());
     for (int aiter = 0; aiter < agg_iters; aiter++) {
@@ -624,6 +794,21 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     }
     if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
   }
+#endif // SKIP_COMM
+
+  for (int iter = 0; iter < COMP_ITER_POST; iter++) {
+    for (int i = 0; i < args->nGpus; i++) {
+      TESTCHECK(runComp(args, i));
+    }
+  }
+
+  if (demo) {
+    for (int i = 0; i < args->nGpus; i++) {
+      TESTCHECK(runEmpty(args, i));
+    }
+  }
+
+  CUDACHECK(cudaSetDevice(gpu_id));
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -717,7 +902,9 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       }
 #endif
 
+#if (SKIP_VERIFICATION == 0)
       TESTCHECK(CheckData(args, type, op, root, in_place, &maxDelta));
+#endif // SKIP_VERIFICATION
 
       //aggregate delta from all threads and procs
       Allreduce(args, &maxDelta, 3);
@@ -776,8 +963,12 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   for (size_t size = args->minbytes; size<=args->maxbytes; size = ((args->stepfactor > 1) ? size*args->stepfactor : size+args->stepbytes)) {
       setupArgs(size, type, args);
       print_line_header(max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, root);
-      TESTCHECK(BenchTime(args, type, op, root, 0));
-      TESTCHECK(BenchTime(args, type, op, root, 1));
+      for (int i = 0; i < 10; ++i) {
+        TESTCHECK(BenchTime(args, type, op, root, 0, 0));
+      }
+      for (int i = 0; i < 10; ++i) {
+        TESTCHECK(BenchTime(args, type, op, root, 1, 0));
+      }
       PRINT("\n");
   }
   return testSuccess;
@@ -1083,12 +1274,16 @@ testResult_t run() {
   void* expected[nGpus*nThreads];
   size_t sendBytes, recvBytes;
 
+  struct compInfo comp_infos[nGpus*nThreads];
+
   ncclTestEngine.getBuffSize(&sendBytes, &recvBytes, (size_t)maxBytes, (size_t)nProcs*nGpus*nThreads);
 
   for (int i=0; i<nGpus*nThreads; i++) {
     CUDACHECK(cudaSetDevice(localRank*nThreads*nGpus+i));
     TESTCHECK(AllocateBuffs(sendbuffs+i, sendBytes, recvbuffs+i, recvBytes, expected+i, (size_t)maxBytes, nProcs*nThreads*nGpus));
     CUDACHECK(cudaStreamCreateWithFlags(streams+i, cudaStreamNonBlocking));
+    (comp_infos+i)->gpu_id = localRank*nThreads*nGpus+i;
+    CUDACHECK(cudaStreamCreateWithFlags(&((comp_infos+i)->stream), cudaStreamNonBlocking));
   }
 
   //if parallel init is not selected, use main thread to initialize NCCL
@@ -1146,6 +1341,8 @@ testResult_t run() {
     threads[t].args.ncclId = ncclId;
     threads[t].args.comms=comms+t*nGpus;
     threads[t].args.streams=streams+t*nGpus;
+
+    threads[t].args.comp_infos = comp_infos+t*nGpus;
 
     threads[t].args.barrier = (volatile int*)barrier;
     threads[t].args.barrier_idx = 0;

@@ -89,6 +89,11 @@ struct testEngine {
 
 extern struct testEngine ncclTestEngine;
 
+struct compInfo {
+  int gpu_id;
+  cudaStream_t stream;
+};
+
 struct threadArgs {
   size_t nbytes;
   size_t minbytes;
@@ -110,6 +115,8 @@ struct threadArgs {
   ncclUniqueId ncclId;
   ncclComm_t* comms;
   cudaStream_t* streams;
+
+  struct compInfo* comp_infos;
 
   void** expected;
   size_t expectedBytes;
