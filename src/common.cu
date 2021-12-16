@@ -575,7 +575,13 @@ static __global__ void gmem_kernel()
     for (int i = idx; i < nd; i += usz) {
       #pragma unroll
       for (int j = 0; j < unroll_depth; ++j) {
-        x += ptr[i+j*sz];
+        // x += ptr[i+j*sz];
+        asm volatile ("{\t\n"
+            ".reg .f64 val;\n\t"
+            "ld.global.cv.f64 val, [%1];\n\t"
+            "add.f64 %0, val, %0;\n\t"
+            "}" : "+d"(x) : "l"(ptr+i+j*sz) : "memory"
+        );
       }
     }
   }
