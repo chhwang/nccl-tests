@@ -19,6 +19,8 @@
 #define SKIP_COMM         0   // 0:disable, 1:enable
 #define SKIP_VERIFICATION 1   // 0:disable, 1:enable
 #define DEMO_BW_SHARING   0   // 0:disable, 1:enable
+#define PRINT_SCHED_INFO  1   // 0:disable, 1:enable
+#define PRINT_STAT_INFO   0   // 0:disable, 1:enable
 
 int test_ncclVersion = 0; // init'd with ncclGetVersion()
 
@@ -520,8 +522,57 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
   return testSuccess;
 }
 
+// Zixing's code.
+// Returns the value of CUDA's global nanosecond timer.
+static __device__ __inline__ uint64_t globalTimer64()
+{
+  // Due to a bug in CUDA's 64-bit globaltimer, the lower 32 bits can wrap
+  // around after the upper bits have already been read. Work around this by
+  // reading the high bits a second time. Use the second value to detect a
+  // rollover, and set the lower bits of the 64-bit "timer reading" to 0, which
+  // would be valid, it's passed over during the duration of the reading. If no
+  // rollover occurred, just return the initial reading.
+  volatile uint64_t first_reading;
+  volatile uint32_t second_reading;
+  uint32_t high_bits_first;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(first_reading));
+  high_bits_first = first_reading >> 32;
+  asm volatile("mov.u32 %0, %%globaltimer_hi;" : "=r"(second_reading));
+  if (high_bits_first == second_reading) {
+    return first_reading;
+  }
+  // Return the value with the updated high bits, but the low bits set to 0.
+  return ((uint64_t) second_reading) << 32;
+}
+
+static __device__ __inline__ uint32_t getSmId()
+{
+  uint32_t to_return;
+  asm volatile("mov.u32 %0, %%smid;" : "=r"(to_return));
+  return to_return;
+}
+
+static __device__ __inline__ void printSchedInfo()
+{
+#if 0
+  // Verbose
+  if (threadIdx.x == 0) {
+    printf("[SchedInfo] Comp Timestamp %lu / Block %u / SM %u\n",
+      blockIdx.x, getSmId(), globalTimer64());
+  }
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("[SchedInfo] Comp Timestamp %lu\n", globalTimer64());
+  }
+#endif
+  __syncthreads();
+}
+
 static __global__ void empty_kernel()
 {
+#if (PRINT_SCHED_INFO == 1)
+    printSchedInfo();
+#endif // PRINT_SCHED_INFO
   // Do nothing.
 }
 
@@ -543,6 +594,9 @@ static __device__ int tmp2;
 
 static __global__ void busy_wait_kernel()
 {
+#if (PRINT_SCHED_INFO == 1)
+    printSchedInfo();
+#endif // PRINT_SCHED_INFO
     int i = tmp1;
     while (i < 400000000) ++i;
     tmp2 = i;
@@ -561,6 +615,9 @@ cudaError_t launchCompKernel(cudaStream_t s, int nblks)
 static __device__ char ld_arr[ARRAY_SIZE];
 static __global__ void gmem_kernel()
 {
+#if (PRINT_SCHED_INFO == 1)
+    printSchedInfo();
+#endif // PRINT_SCHED_INFO
   // Should be multiple of 32 and power of 2
   constexpr int num_threads = 256;
   constexpr int unroll_depth = 128;
@@ -607,6 +664,9 @@ static __device__ char arr[L2_CACHE_SIZE];
 // Referred to code in https://arxiv.org/pdf/1804.06826.pdf
 static __global__ void l2_kernel()
 {
+#if (PRINT_SCHED_INFO == 1)
+    printSchedInfo();
+#endif // PRINT_SCHED_INFO
     constexpr int ntmo = NUM_THREADS - 1;
     constexpr int nd = L2_CACHE_SIZE / 8;
     double x = 0;
@@ -643,6 +703,9 @@ static __device__ float fma_out;
 
 static __global__ void ffma_kernel()
 {
+#if (PRINT_SCHED_INFO == 1)
+    printSchedInfo();
+#endif // PRINT_SCHED_INFO
     float a = -1e5f;
     float b = -1e5f;
     for (int it = 0; it < 81920; ++it) {
@@ -925,11 +988,13 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   } else {
     sprintf(timeStr, "%7.2f", timeUsec);
   }
+#if (PRINT_STAT_INFO == 1)
   if (datacheck) {
      PRINT("  %7s  %6.2f  %6.2f  %5.0le", timeStr, algBw, busBw, maxDelta);
   } else {
      PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
   }
+#endif // PRINT_STAT_INFO
 
   args->bw[0] += busBw;
   args->bw_count[0]++;
@@ -968,14 +1033,18 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   // Benchmark
   for (size_t size = args->minbytes; size<=args->maxbytes; size = ((args->stepfactor > 1) ? size*args->stepfactor : size+args->stepbytes)) {
       setupArgs(size, type, args);
+#if (PRINT_STAT_INFO == 1)
       print_line_header(max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, root);
+#endif // PRINT_STAT_INFO
       for (int i = 0; i < 10; ++i) {
         TESTCHECK(BenchTime(args, type, op, root, 0, 0));
       }
       for (int i = 0; i < 10; ++i) {
         TESTCHECK(BenchTime(args, type, op, root, 1, 0));
       }
+#if (PRINT_STAT_INFO == 1)
       PRINT("\n");
+#endif // PRINT_STAT_INFO
   }
   return testSuccess;
 }
@@ -1319,8 +1388,10 @@ testResult_t run() {
     errors[t] = bw_count[t] = 0;
   }
 
+#if (PRINT_STAT_INFO == 1)
   PRINT("#\n");
   print_header();
+#endif // PRINT_STAT_INFO
 
   int* sync = (int*)calloc(2, sizeof(int));
   int* barrier = (int*)calloc(2, sizeof(int));
