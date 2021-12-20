@@ -824,11 +824,13 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     TESTCHECK(args->collTest->initData(args, type, op, root, 99, in_place));
   }
 
+#if (SKIP_COMM == 0)
   // Sync
   TESTCHECK(startColl(args, type, op, root, in_place, 0));
   TESTCHECK(completeColl(args));
 
   Barrier(args);
+#endif // SKIP_COMM
 
 #if CUDART_VERSION >= 11030
   cudaGraph_t graphs[args->nGpus];
