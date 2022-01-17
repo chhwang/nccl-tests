@@ -14,7 +14,8 @@
 // Options
 #define COMP_NUM_BLOCKS   84
 #define COMP_ITER_PRE     0
-#define COMP_ITER_POST    1
+#define COMP_ITER_POST    0
+#define COMP_ITER_INT     1
 #define COMP_TYPE         1   // 0:busy_wait, 1:gmem, 2:L2, 3:ffma
 #define SKIP_COMM         0   // 0:disable, 1:enable
 #define SKIP_VERIFICATION 1   // 0:disable, 1:enable
@@ -864,6 +865,12 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));
     }
     if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
+    
+    for (int iter = 0; iter < COMP_ITER_INT; iter++) {
+      for (int i = 0; i < args->nGpus; i++) {
+        TESTCHECK(runComp(args, i));
+      }
+    }
   }
 #endif // SKIP_COMM
 
