@@ -17,6 +17,7 @@
 #define COMP_ITER_POST    0
 #define COMP_ITER_INT     1
 #define COMP_TYPE         1   // 0:busy_wait, 1:gmem, 2:L2, 3:ffma
+#define COMP_SEQUENTIAL   1   // 0:disable, 1:enable
 #define SKIP_COMM         0   // 0:disable, 1:enable
 #define SKIP_VERIFICATION 1   // 0:disable, 1:enable
 #define DEMO_BW_SHARING   0   // 0:disable, 1:enable
@@ -1367,7 +1368,11 @@ testResult_t run() {
     TESTCHECK(AllocateBuffs(sendbuffs+i, sendBytes, recvbuffs+i, recvBytes, expected+i, (size_t)maxBytes, nProcs*nThreads*nGpus));
     CUDACHECK(cudaStreamCreateWithFlags(streams+i, cudaStreamNonBlocking));
     (comp_infos+i)->gpu_id = localRank*nThreads*nGpus+i;
+#if (COMP_SEQUENTIAL == 0)
     CUDACHECK(cudaStreamCreateWithFlags(&((comp_infos+i)->stream), cudaStreamNonBlocking));
+#else
+    (comp_infos+i)->stream = streams[i];
+#endif // COMP_SEQUENTIAL 
   }
 
   //if parallel init is not selected, use main thread to initialize NCCL
